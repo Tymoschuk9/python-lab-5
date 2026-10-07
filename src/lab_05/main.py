@@ -27,6 +27,12 @@ class DataValidationError(DataError):
 class ConfigurationError(ApplicationError):
     pass
 
+class DataImportError(DataError):
+    pass
+
+class DataExportError(DataError):
+    pass
+
 # --- Atomic Writer ---
 @contextmanager
 def atomic_write(file_path: str | Path) -> Generator[Any, None, None]:
@@ -49,6 +55,8 @@ def atomic_write(file_path: str | Path) -> Generator[Any, None, None]:
 # --- Processor ---
 class DataProcessor:
     def __init__(self, config: Dict[str, Any]):
+        if not isinstance(config, dict):
+            raise ConfigurationError("Config must be a dictionary")
         self.config = config
 
     def validate_record(self, record: Dict[str, Any], line_num: int):
@@ -64,31 +72,33 @@ class DataProcessor:
     def process_file(self, input_path: str, output_path: str):
         input_path_obj = Path(input_path)
         if not input_path_obj.exists():
-            raise ConfigurationError(f"File not found: {input_path}")
+            raise DataImportError(f"File not found: {input_path}")
 
         try:
-            with open(input_path, 'r', encoding='utf-8') as fin, \
-                 atomic_write(output_path) as fout:
-                
+            with open(input_path, 'r', encoding='utf-8') as fin:
                 reader = csv.DictReader(fin)
-                first_record = True
-                fout.write("[\n")
-                
-                for i, row in enumerate(reader, start=1):
-                    try:
-                        self.validate_record(row, i)
-                        data = {"id": int(row["id"]), "value": float(row["value"])}
+                try:
+                    with atomic_write(output_path) as fout:
+                        fout.write("[\n")
+                        first_record = True
                         
-                        if not first_record:
-                            fout.write(",\n")
-                        fout.write(json.dumps(data))
-                        first_record = False
-                    except DataValidationError as e:
-                        logger.error(f"Skipping line {e.line_number}: {e} (Field: {e.field})")
-                
-                fout.write("\n]")
+                        for i, row in enumerate(reader, start=1):
+                            try:
+                                self.validate_record(row, i)
+                                data = {"id": int(row["id"]), "value": float(row["value"])}
+                                
+                                if not first_record:
+                                    fout.write(",\n")
+                                fout.write(json.dumps(data))
+                                first_record = False
+                            except DataValidationError as e:
+                                logger.error(f"Skipping line {e.line_number}: {e} (Field: {e.field})")
+                        
+                        fout.write("\n]")
+                except (IOError, OSError) as e:
+                    raise DataExportError(f"Failed to write output file: {e}")
         except (IOError, OSError) as e:
-            raise ApplicationError(f"File I/O error: {e}")
+            raise DataImportError(f"Failed to read input file: {e}")
 
 def main():
     config = {"threshold": 10}
