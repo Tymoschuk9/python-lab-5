@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lab_05"
+version = "0.1.0"
+description = "Laboratory work #5 (Variant 3)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+lab_05 = "lab_05.main:main"
