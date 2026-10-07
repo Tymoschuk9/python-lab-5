@@ -1,17 +1,15 @@
-import json
-import csv
-import logging
 import os
 import sys
-import tempfile
+import csv
+import json
+import logging
 from pathlib import Path
-from typing import Generator, Dict, Any, List, Optional
-from datetime import datetime
+from typing import Generator, Dict, Any, List, Optional, Tuple
 from contextlib import contextmanager
 from time import perf_counter
 
 # =====================================================================
-# КЛАСИ ПОМИЛОК (EXCEPTION HIERARCHY)
+# 1. СИСТЕМА ВЛАСНИХ ВИНЯТКІВ (DOMAIN EXCEPTIONS HIERARCHY)
 # =====================================================================
 
 class ApplicationError(Exception):
@@ -19,33 +17,18 @@ class ApplicationError(Exception):
     pass
 
 
-class ConfigurationError(ApplicationError):
-    """Помилка конфігурації (наприклад, відсутній файл конфігурації або невірні параметри)."""
-    pass
-
-
 class DataError(ApplicationError):
-    """Базовий виняток для помилок обробки даних."""
-    pass
-
-
-class DataImportError(DataError):
-    """Помилка імпорту або читання файлу даних."""
-    pass
-
-
-class DataExportError(DataError):
-    """Помилка експорту або запису файлу даних."""
+    """Базовий виняток для помилок, пов'язаних з обробкою даних."""
     pass
 
 
 class DataValidationError(DataError):
-    """Базова помилка валідації структури даних."""
+    """Виняток, що виникає при загальній невідповідності даних правилам валідації."""
     pass
 
 
 class RecordValidationError(DataValidationError):
-    """Помилка валідації конкретного запису."""
+    """Деталізований виняток для помилки валідації конкретного запису."""
 
     def __init__(
         self,
@@ -53,225 +36,184 @@ class RecordValidationError(DataValidationError):
         *,
         line_number: Optional[int] = None,
         field: Optional[str] = None,
-        raw_value: Optional[Any] = None,
     ) -> None:
         super().__init__(message)
         self.line_number = line_number
         self.field = field
-        self.raw_value = raw_value
 
     def __str__(self) -> str:
         base_msg = super().__str__()
         details = []
         if self.line_number is not None:
-            details.append(f"рядок/індекс: {self.line_number}")
+            details.append(f"рядок {self.line_number}")
         if self.field is not None:
-            details.append(f"поле: '{self.field}'")
-        if self.raw_value is not None:
-            details.append(f"отримано значення: '{self.raw_value}'")
-        
+            details.append(f"поле '{self.field}'")
         if details:
             return f"{base_msg} ({', '.join(details)})"
         return base_msg
 
 
+class DataImportError(DataError):
+    """Помилка імпорту або читання зовнішнього ресурсу."""
+    pass
+
+
+class DataExportError(DataError):
+    """Помилка експорту чи збереження результату."""
+    pass
+
+
+class ConfigurationError(ApplicationError):
+    """Помилка конфігурації додатка (неправильні параметри або відсутні файли)."""
+    pass
+
+
 # =====================================================================
-# КОНТЕКСТНІ МЕНЕДЖЕРИ (CONTEXT MANAGERS)
+# 2. ВЛАСНІ CONTEXT MANAGERS
 # =====================================================================
+
+class AtomicFileWriter:
+    """
+    Контекстний менеджер для атомарного запису у файл.
+    Записує дані у тимчасовий файл у тій самій директорії.
+    У разі успіху файл атомарно замінює цільовий.
+    У разі винятку - тимчасовий файл видаляється, не пошкоджуючи оригінал.
+    """
+
+    def __init__(self, dest_path: Path, mode: str = "w", encoding: str = "utf-8") -> None:
+        self.dest_path = Path(dest_path)
+        self.mode = mode
+        self.encoding = encoding
+        self.temp_file_path: Optional[Path] = None
+        self._file = None
+
+    def __enter__(self):
+        parent = self.dest_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        # Створюємо тимчасовий файл в тій самій директорії (для гарантії однієї FS)
+        suffix = f".tmp_{os.getpid()}"
+        self.temp_file_path = parent / f"{self.dest_path.name}{suffix}"
+        self._file = open(self.temp_file_path, self.mode, encoding=self.encoding)
+        return self._file
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._file:
+            self._file.close()
+
+        if exc_type is not None:
+            # Якщо виникла помилка, видаляємо тимчасовий файл
+            if self.temp_file_path and self.temp_file_path.exists():
+                try:
+                    self.temp_file_path.unlink()
+                except OSError:
+                    pass
+            return False  # Пропускаємо помилку далі
+
+        # Якщо все успішно, виконуємо атомарну заміну
+        if self.temp_file_path and self.temp_file_path.exists():
+            try:
+                self.temp_file_path.replace(self.dest_path)
+            except OSError as err:
+                raise DataExportError(f"Не вдалося атомарно перейменувати файл у {self.dest_path}") from err
+        return False
+
 
 @contextmanager
 def execution_timer(activity_name: str) -> Generator[None, None, None]:
     """Генераторний контекстний менеджер для вимірювання часу виконання."""
-    start_time = perf_counter()
-    logging.info(f"Початок операції: '{activity_name}'...")
+    start = perf_counter()
     try:
         yield
     finally:
-        duration = perf_counter() - start_time
-        logging.info(f"Операція '{activity_name}' завершена за {duration:.6f} сек.")
+        elapsed = perf_counter() - start
+        logging.info(f"Операція '{activity_name}' виконана за {elapsed:.6f} сек.")
 
 
-class AtomicFileWriter:
+# =====================================================================
+# 3. ДОПОМІЖНІ ПАРСЕРИ ТА КОНФІГУРАЦІЯ
+# =====================================================================
+
+def parse_simple_yaml(content: str) -> Dict[str, Any]:
     """
-    Клас-контекстний менеджер для атомарного запису у файл.
-    Дані спочатку записуються у тимчасовий файл у тій самій директорії,
-    і лише в разі успішного завершення блоку with, тимчасовий файл
-    заміщує цільовий (atomic replace). Це запобігає пошкодженню оригінального
-    файлу при виникненні непередбачуваних помилок у процесі запису.
+    Кастомний парсер спрощеного YAML формату (key: value)
+    для уникнення зовнішніх залежностей (PyYAML), якщо вони відсутні.
     """
-
-    def __init__(self, target_path: Path | str, mode: str = "w", encoding: str = "utf-8") -> None:
-        self.target_path = Path(target_path)
-        self.mode = mode
-        self.encoding = encoding
-        self.temp_file = None
-        self.temp_path = None
-
-    def __enter__(self) -> Any:
-        # Створюємо тимчасовий файл в тій же папці, щоб забезпечити швидку атомарну заміну
-        parent_dir = self.target_path.parent
-        parent_dir.mkdir(parents=True, exist_ok=True)
+    result = {}
+    for line_no, line in enumerate(content.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' not in line:
+            continue
+        key, val = line.split(':', 1)
+        key = key.strip()
+        val = val.strip()
         
-        self.temp_file = tempfile.NamedTemporaryFile(
-            mode=self.mode,
-            dir=parent_dir,
-            delete=False,
-            suffix=".tmp",
-            encoding=self.encoding if "b" not in self.mode else None
-        )
-        self.temp_path = Path(self.temp_file.name)
-        return self.temp_file
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if self.temp_file:
-            self.temp_file.close()
-
-        if exc_type is None:
-            # Помилок не було, робимо атомарне перейменування
-            try:
-                self.temp_path.replace(self.target_path)
-                logging.debug(f"Атомарно записано файл: {self.target_path}")
-            except Exception as e:
-                if self.temp_path.exists():
-                    self.temp_path.unlink()
-                raise DataExportError(f"Не вдалося виконати атомарний запис у {self.target_path}") from e
+        # Очищення від лапок
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+            
+        # Конвертація типів даних
+        if val.lower() == 'true':
+            val = True
+        elif val.lower() == 'false':
+            val = False
         else:
-            # Сталася помилка, видаляємо тимчасовий файл, оригінал залишається неушкодженим
-            logging.warning("Під час запису сталася помилка. Тимчасовий файл видалено, зміни відхилено.")
-            if self.temp_path and self.temp_path.exists():
-                self.temp_path.unlink()
-        
-        return False  # Не пригнічуємо винятки, дозволяємо їм йти вище
+            try:
+                if '.' in val:
+                    val = float(val)
+                else:
+                    val = int(val)
+            except ValueError:
+                pass
+        result[key] = val
+    return result
 
-
-# =====================================================================
-# КЛАС КОНФІГУРАЦІЇ (CONFIGURATION MANAGER)
-# =====================================================================
 
 class AppConfig:
-    """Менеджер конфігурації додатка (Fail-fast валідація при завантаженні)."""
+    """Клас конфігурації з реалізацією підходу fail-fast."""
 
-    def __init__(self, config_path: Path | str) -> None:
-        self.config_path = Path(config_path)
-        self.data: Dict[str, Any] = {}
-        self.load_config()
+    def __init__(self, data: Dict[str, Any]) -> None:
+        self.input_file = Path(data.get("input_file", ""))
+        self.input_format = str(data.get("input_format", "")).lower()
+        self.output_file = Path(data.get("output_file", ""))
+        self.output_format = str(data.get("output_format", "")).lower()
+        self.policy = str(data.get("policy", "log_and_skip")).lower()
+        self.min_temperature = float(data.get("min_temperature", -50.0))
+        self.max_temperature = float(data.get("max_temperature", 100.0))
+        self.min_humidity = float(data.get("min_humidity", 0.0))
+        self.max_humidity = float(data.get("max_humidity", 100.0))
 
-    def load_config(self) -> None:
-        """Завантажує та валідує конфігураційний файл. Застосовує принцип Fail-fast."""
-        if not self.config_path.exists():
-            raise ConfigurationError(f"Конфігураційний файл не знайдено за шляхом: {self.config_path}")
-
-        try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                self.data = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ConfigurationError(f"Помилка парсингу JSON у конфігурації: {e}") from e
-        except Exception as e:
-            raise ConfigurationError(f"Неочікувана помилка при читанні конфігурації: {e}") from e
-
-        self._validate_config()
-
-    def _validate_config(self) -> None:
-        """Перевіряє наявність та коректність критичних параметрів конфігурації."""
-        # Fail-fast перевірка обов'язкових секцій
-        if "validation" not in self.data:
-            raise ConfigurationError("Конфігурація не містить обов'язкової секції 'validation'")
+    def validate(self) -> None:
+        """Метод fail-fast валідації конфігурації додатка."""
+        if not self.input_file:
+            raise ConfigurationError("Вхідний файл конфігурації не вказано.")
+        if self.input_format not in ("csv", "jsonl"):
+            raise ConfigurationError(f"Непідтримуваний формат входу: '{self.input_format}'. Очікується 'csv' або 'jsonl'.")
+        if not self.output_file:
+            raise ConfigurationError("Вихідний файл конфігурації не вказано.")
+        if self.output_format not in ("csv", "jsonl"):
+            raise ConfigurationError(f"Непідтримуваний формат виходу: '{self.output_format}'.")
+        if self.policy not in ("strict", "log_and_skip", "force_default"):
+            raise ConfigurationError(f"Невідома політика валідації: '{self.policy}'.")
+        if self.min_temperature >= self.max_temperature:
+            raise ConfigurationError("min_temperature має бути строго меншою за max_temperature.")
+        if self.min_humidity >= self.max_humidity:
+            raise ConfigurationError("min_humidity має бути строго меншою за max_humidity.")
         
-        val_sec = self.data["validation"]
-        required_keys = ["temp_min", "temp_max", "humidity_min", "humidity_max", "allowed_statuses"]
-        for key in required_keys:
-            if key not in val_sec:
-                raise ConfigurationError(f"Відсутній обов'язковий параметр валідації: '{key}'")
-
-        # Перевірка коректності діапазонів
-        if val_sec["temp_min"] >= val_sec["temp_max"]:
-            raise ConfigurationError("temp_min не може бути більшим або рівним temp_max")
-        if not (0 <= val_sec["humidity_min"] < val_sec["humidity_max"] <= 100):
-            raise ConfigurationError("humidity_min та humidity_max мають бути в діапазоні [0, 100]")
-
-        # Перевірка політики обробки помилок
-        policy = self.data.get("policy", "log_and_skip")
-        allowed_policies = ["raise_on_invalid", "log_and_skip", "ignore_invalid"]
-        if policy not in allowed_policies:
-            raise ConfigurationError(f"Невідома політика обробки помилок '{policy}'. Дозволені: {allowed_policies}")
-
-    @property
-    def validation_rules(self) -> Dict[str, Any]:
-        return self.data["validation"]
-
-    @property
-    def error_policy(self) -> str:
-        return self.data.get("policy", "log_and_skip")
-
-    @property
-    def log_level(self) -> str:
-        return self.data.get("log_level", "INFO")
+        # Перевірка існування вхідного файлу
+        if not self.input_file.exists():
+            raise ConfigurationError(f"Вхідний файл не існує: {self.input_file.absolute()}")
 
 
 # =====================================================================
-# STREAMING READERS (ПРИНЦИП STREAMING I/O)
-# =====================================================================
-
-class DataStreamer:
-    """Базовий потоковий зчитувач даних без повного завантаження файлу в пам'ять."""
-
-    @staticmethod
-    def stream_csv(file_path: Path) -> Generator[Dict[str, str], None, None]:
-        """Потоково читає CSV файл рядок за рядком."""
-        if not file_path.exists():
-            raise FileNotFoundError(f"Файл не знайдено: {file_path}")
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row_idx, row in enumerate(reader, start=1):
-                    # Yields row and attaches a line marker
-                    row["__line_number__"] = str(row_idx)
-                    yield row
-        except Exception as e:
-            raise DataImportError(f"Помилка при потоковому читанні CSV '{file_path}': {e}") from e
-
-    @staticmethod
-    def stream_jsonl(file_path: Path) -> Generator[Dict[str, Any], None, None]:
-        """Потоково читає файл у форматі JSON Lines (JSONL) рядок за рядком."""
-        if not file_path.exists():
-            raise FileNotFoundError(f"Файл не знайдено: {file_path}")
-
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                for row_idx, line in enumerate(f, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        record = json.loads(line)
-                        if isinstance(record, dict):
-                            record["__line_number__"] = row_idx
-                            yield record
-                        else:
-                            raise RecordValidationError(
-                                "Запис у JSONL має бути об'єктом (dict)", 
-                                line_number=row_idx
-                            )
-                    except json.JSONDecodeError as je:
-                        raise RecordValidationError(
-                            f"Некоректний JSON-синтаксис рядка: {je}", 
-                            line_number=row_idx
-                        ) from je
-        except RecordValidationError:
-            raise  # Пропускаємо далі власну помилку
-        except Exception as e:
-            raise DataImportError(f"Помилка читання JSONL файлу '{file_path}': {e}") from e
-
-
-# =====================================================================
-# ВАЛІДАТОР ТА КОНВЕРТОР ДОМЕННОЇ МОДЕЛІ (EAFP / LBYL)
+# 4. СТРУКТУРИ ДАНИХ (DOMAIN MODEL)
 # =====================================================================
 
 class SensorReading:
-    """Доменна модель показника датчика IoT (Варіант №3)."""
+    """Сутність телеметрії сенсора (Варіант №3)."""
 
-    def __init__(self, sensor_id: str, timestamp: datetime, temperature: float, humidity: float, status: str) -> None:
+    def __init__(self, sensor_id: str, timestamp: str, temperature: float, humidity: float, status: str) -> None:
         self.sensor_id = sensor_id
         self.timestamp = timestamp
         self.temperature = temperature
@@ -279,344 +221,348 @@ class SensorReading:
         self.status = status
 
     def to_dict(self) -> Dict[str, Any]:
-        """Серіалізація доменної моделі в словник."""
         return {
             "sensor_id": self.sensor_id,
-            "timestamp": self.timestamp.isoformat(),
-            "temperature": round(self.temperature, 2),
-            "humidity": round(self.humidity, 2),
+            "timestamp": self.timestamp,
+            "temperature": self.temperature,
+            "humidity": self.humidity,
             "status": self.status
         }
 
-    def __repr__(self) -> str:
-        return f"SensorReading({self.sensor_id}, {self.timestamp.strftime('%H:%M:%S')}, T: {self.temperature}°C, H: {self.humidity}%)"
+
+# =====================================================================
+# 5. СТРІМІНГОВЕ ЧИТАННЯ (STREAMING I/O) ТА ПАРСИНГ З EAFP
+# =====================================================================
+
+def read_csv_streaming(file_path: Path) -> Generator[Dict[str, str], None, None]:
+    """Стрімінгове читання CSV-файлу рядок за рядком (Generator)."""
+    with open(file_path, "r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            yield row
 
 
-class SensorDataValidator:
-    """Валідатор сирих даних та конвертор у доменну модель."""
+def read_jsonl_streaming(file_path: Path) -> Generator[Dict[str, Any], None, None]:
+    """Стрімінгове читання JSON Lines файлу рядок за рядком."""
+    with open(file_path, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
 
-    def __init__(self, rules: Dict[str, Any]) -> None:
-        self.rules = rules
 
-    def validate_and_convert(self, raw_data: Dict[str, Any]) -> SensorReading:
-        """
-        Валідує сирі дані та повертає екземпляр SensorReading.
-        Використовує підхід EAFP (Easier to Ask Forgiveness than Permission)
-        для парсингу типів та виявлення відсутніх полів.
-        """
-        line_num = raw_data.get("__line_number__")
-        if line_num is not None:
-            try:
-                line_num = int(line_num)
-            except ValueError:
-                line_num = None
+def parse_and_validate_row(row: Dict[str, Any], line_idx: int, config: AppConfig) -> SensorReading:
+    """
+    Парсинг та валідація даних сенсора з використанням концепції EAFP 
+    та Exception Chaining для точної діагностики помилок.
+    """
+    # 1. Перевірка наявності обов'язкових ключів
+    for field in ("sensor_id", "timestamp", "temperature", "humidity", "status"):
+        if field not in row or row[field] is None or str(row[field]).strip() == "":
+            raise RecordValidationError(f"Відсутнє обов'язкове поле: '{field}'", line_number=line_idx, field=field)
 
-        # 1. Перевірка наявності ключів та конвертація типів (EAFP)
-        try:
-            raw_sensor_id = raw_data["sensor_id"]
-            raw_timestamp = raw_data["timestamp"]
-            raw_temp = raw_data["temperature"]
-            raw_hum = raw_data["humidity"]
-            raw_status = raw_data["status"]
-        except KeyError as ke:
+    sensor_id = str(row["sensor_id"]).strip()
+    timestamp = str(row["timestamp"]).strip()
+
+    # 2. Перетворення типів з використанням EAFP
+    try:
+        temp_val = float(row["temperature"])
+    except (ValueError, TypeError) as err:
+        raise RecordValidationError(
+            "Температура повинна бути числом",
+            line_number=line_idx,
+            field="temperature"
+        ) from err
+    else:
+        # Цей блок виконується, якщо винятку не було. Додаткова бізнес-валідація діапазонів
+        if not (config.min_temperature <= temp_val <= config.max_temperature):
             raise RecordValidationError(
-                "Відсутнє обов'язкове поле у записі",
-                line_number=line_num,
-                field=ke.args[0]
-            ) from ke
-
-        # Конвертація ID (має бути непустим)
-        sensor_id = str(raw_sensor_id).strip()
-        if not sensor_id:
-            raise RecordValidationError(
-                "Ідентифікатор сенсора не може бути порожнім",
-                line_number=line_num,
-                field="sensor_id",
-                raw_value=raw_sensor_id
+                f"Температура {temp_val} виходить за межі діапазону [{config.min_temperature}, {config.max_temperature}]",
+                line_number=line_idx,
+                field="temperature"
             )
 
-        # Конвертація часу
-        try:
-            # Спроба зчитати ISO-формат
-            timestamp = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
-        except ValueError as ve:
+    try:
+        hum_val = float(row["humidity"])
+    except (ValueError, TypeError) as err:
+        raise RecordValidationError(
+            "Вологість повинна бути числом",
+            line_number=line_idx,
+            field="humidity"
+        ) from err
+    else:
+        if not (config.min_humidity <= hum_val <= config.max_humidity):
             raise RecordValidationError(
-                "Некоректний формат дати/часу (має бути ISO 8601)",
-                line_number=line_num,
-                field="timestamp",
-                raw_value=raw_timestamp
-            ) from ve
-
-        # Конвертація температури
-        try:
-            temperature = float(raw_temp)
-        except ValueError as ve:
-            raise RecordValidationError(
-                "Температура має бути числовим значенням",
-                line_number=line_num,
-                field="temperature",
-                raw_value=raw_temp
-            ) from ve
-
-        # Конвертація вологості
-        try:
-            humidity = float(raw_hum)
-        except ValueError as ve:
-            raise RecordValidationError(
-                "Вологість має бути числовим значенням",
-                line_number=line_num,
-                field="humidity",
-                raw_value=raw_hum
-            ) from ve
-
-        status = str(raw_status).strip().upper()
-
-        # 2. Логічна валідація бізнес-правил (LBYL)
-        if not (self.rules["temp_min"] <= temperature <= self.rules["temp_max"]):
-            raise RecordValidationError(
-                f"Температура поза дозволеним діапазоном [{self.rules['temp_min']}, {self.rules['temp_max']}]",
-                line_number=line_num,
-                field="temperature",
-                raw_value=temperature
+                f"Вологість {hum_val} виходить за межі діапазону [{config.min_humidity}, {config.max_humidity}]",
+                line_number=line_idx,
+                field="humidity"
             )
 
-        if not (self.rules["humidity_min"] <= humidity <= self.rules["humidity_max"]):
-            raise RecordValidationError(
-                f"Вологість поза дозволеним діапазоном [{self.rules['humidity_min']}, {self.rules['humidity_max']}]",
-                line_number=line_num,
-                field="humidity",
-                raw_value=humidity
-            )
-
-        if status not in self.rules["allowed_statuses"]:
-            raise RecordValidationError(
-                f"Недопустимий статус. Дозволені: {self.rules['allowed_statuses']}",
-                line_number=line_num,
-                field="status",
-                raw_value=status
-            )
-
-        return SensorReading(
-            sensor_id=sensor_id,
-            timestamp=timestamp,
-            temperature=temperature,
-            humidity=humidity,
-            status=status
+    status = str(row["status"]).strip().upper()
+    if status not in ("OK", "WARNING", "ERROR"):
+        raise RecordValidationError(
+            f"Некоректний статус: '{status}'. Очікується OK, WARNING або ERROR.",
+            line_number=line_idx,
+            field="status"
         )
 
-
-# =====================================================================
-# ГОЛОВНИЙ ПАЙПЛАЙН ОБРОБКИ (DATA PIPELINE)
-# =====================================================================
-
-class DataProcessingPipeline:
-    """Головний керуючий клас для імпорту, валідації та експорту даних."""
-
-    def __init__(self, config: AppConfig) -> None:
-        self.config = config
-        self.validator = SensorDataValidator(config.validation_rules)
-
-    def process(self, input_file: Path, output_file: Path) -> None:
-        """Запуск повного потокового циклу обробки."""
-        # Fail-fast перевірка наявності вхідного файлу
-        if not input_file.exists():
-            raise DataImportError(f"Вхідний файл не знайдено: {input_file}")
-
-        suffix = input_file.suffix.lower()
-        if suffix == ".csv":
-            stream = DataStreamer.stream_csv(input_file)
-        elif suffix in [".jsonl", ".json"]:
-            # Для великих файлів використовуємо JSON Lines потоковий формат
-            stream = DataStreamer.stream_jsonl(input_file)
-        else:
-            raise DataImportError(f"Непідтримуваний формат файлу: {suffix}")
-
-        processed_count = 0
-        skipped_count = 0
-
-        # Використовуємо атомарний запис у вихідний файл
-        # Також здійснюємо потоковий запис у вихідний JSON Lines файл
-        with execution_timer(f"Обробка файлу {input_file.name} -> {output_file.name}"):
-            try:
-                with AtomicFileWriter(output_file, mode="w") as out_file:
-                    for raw_record in stream:
-                        try:
-                            # Валідація та конвертація рядок за рядком
-                            domain_model = self.validator.validate_and_convert(raw_record)
-                            
-                            # Серіалізація та запис у вихідний потік
-                            serialized = json.dumps(domain_model.to_dict())
-                            out_file.write(serialized + "\n")
-                            processed_count += 1
-
-                        except RecordValidationError as rve:
-                            # Обробка винятків відповідно до політики з конфігурації
-                            policy = self.config.error_policy
-                            if policy == "raise_on_invalid":
-                                logging.error(f"Критична помилка валідації запису (політика: {policy}): {rve}")
-                                raise
-                            elif policy == "log_and_skip":
-                                logging.warning(f"Пропущено некоректний запис: {rve}")
-                                skipped_count += 1
-                            elif policy == "ignore_invalid":
-                                # Повне ігнорування без логування
-                                skipped_count += 1
-
-            except RecordValidationError as e:
-                # Повторно викидаємо для руйнування процесу, якщо встановлено політику raise_on_invalid
-                raise DataError("Обробка даних перервана через некоректний запис.") from e
-            except Exception as e:
-                raise DataExportError(f"Помилка в процесі потокової обробки: {e}") from e
-
-        logging.info(f"Обробка успішно завершена. Оброблено успішно: {processed_count}, пропущено: {skipped_count}")
+    return SensorReading(sensor_id, timestamp, temp_val, hum_val, status)
 
 
 # =====================================================================
-# ДЕМОНСТРАЦІЯ РОБОТИ (MAIN)
+# 6. PIPELINE ОБРОБКИ
 # =====================================================================
 
-def create_mock_environment(working_dir: Path) -> tuple[Path, Path, Path, Path]:
-    """Створює необхідні тимчасові файли для демонстрації роботи системи."""
-    working_dir.mkdir(parents=True, exist_ok=True)
+def run_pipeline(config_path: Path) -> None:
+    """Головний pipeline обробки згідно зі схемою лабораторної роботи."""
+    # Відкриття ресурсу та завантаження сирої конфігурації
+    try:
+        with open(config_path, "r", encoding="utf-8") as file:
+            config_content = file.read()
+    except OSError as err:
+        raise ConfigurationError(f"Не вдалося зчитати конфігураційний файл: {config_path}") from err
 
-    # 1. Створення файлу конфігурації
-    config_path = working_dir / "config.json"
-    config_data = {
-        "validation": {
-            "temp_min": -30.0,
-            "temp_max": 50.0,
-            "humidity_min": 10.0,
-            "humidity_max": 95.0,
-            "allowed_statuses": ["OK", "WARNING", "ERROR"]
-        },
-        "policy": "log_and_skip",  # Може бути: raise_on_invalid, log_and_skip, ignore_invalid
-        "log_level": "INFO"
-    }
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config_data, f, indent=4)
+    # Парсинг конфігурації (YAML або JSON)
+    if config_path.suffix in (".yaml", ".yml"):
+        config_data = parse_simple_yaml(config_content)
+    else:
+        try:
+            config_data = json.loads(config_content)
+        except json.JSONDecodeError as err:
+            raise ConfigurationError("Некоректний формат JSON конфігурації") from err
 
-    # 2. Створення вхідного файлу CSV (із декількома помилковими рядками для тестування валідації)
-    csv_input_path = working_dir / "sensor_data.csv"
-    csv_rows = [
-        ["sensor_id", "timestamp", "temperature", "humidity", "status"],
-        ["SN-001", "2023-10-27T10:00:00Z", "22.5", "45.0", "OK"],
-        ["SN-002", "2023-10-27T10:05:00Z", "-45.0", "50.0", "OK"],          # Помилка: температура занизька
-        ["SN-003", "2023-10-27T10:10:00Z", "18.0", "120.0", "WARNING"],     # Помилка: вологість > 100%
-        ["SN-004", "Невідомий_Час", "25.0", "40.0", "ERROR"],                # Помилка: формат дати
-        ["SN-005", "2023-10-27T10:20:00Z", "abc", "55.0", "OK"],            # Помилка: температура не число
-        ["SN-006", "2023-10-27T10:25:00Z", "35.2", "88.5", "OK"],           # Ок запис
-        ["", "2023-10-27T10:30:00Z", "12.0", "30.0", "OK"],                 # Помилка: пустий sensor_id
-        ["SN-007", "2023-10-27T10:35:00Z", "15.0", "30.0", "INVALID_STAT"]   # Помилка: статус не в списку дозволених
-    ]
-    with open(csv_input_path, "w", newline="", encoding="utf-8") as f:
+    # Ініціалізація та Fail-fast валідація конфігурації
+    config = AppConfig(config_data)
+    config.validate()
+
+    logging.info(f"Пайплайн запущено. Вхідний файл: {config.input_file} ({config.input_format.upper()})")
+
+    # Визначення стрімінгового рідера
+    if config.input_format == "csv":
+        reader = read_csv_streaming(config.input_file)
+    else:
+        reader = read_jsonl_streaming(config.input_file)
+
+    processed_count = 0
+    written_count = 0
+
+    # Використання власного context manager для виміру часу
+    with execution_timer("Processing Pipeline"):
+        try:
+            # Використання власного контекстного менеджера для атомарного запису результату
+            with AtomicFileWriter(config.output_file, "w") as out_file:
+                writer = None
+                if config.output_format == "csv":
+                    writer = csv.DictWriter(
+                        out_file, 
+                        fieldnames=["sensor_id", "timestamp", "temperature", "humidity", "status"]
+                    )
+                    writer.writeheader()
+
+                for idx, row in enumerate(reader, 1):
+                    processed_count += 1
+                    try:
+                        reading = parse_and_validate_row(row, idx, config)
+                    except RecordValidationError as error:
+                        # Реалізація політики обробки помилок відповідно до конфігурації
+                        if config.policy == "strict":
+                            raise DataValidationError(
+                                f"Критична помилка в STRICT режимі на рядку {idx}: {error}"
+                            ) from error
+                        
+                        elif config.policy == "log_and_skip":
+                            logging.warning(f"Рядок {idx} пропущено: {error}")
+                            continue
+                        
+                        elif config.policy == "force_default":
+                            logging.info(f"Рядок {idx} виправлено значеннями за замовчуванням: {error}")
+                            # Застосування безпечних значень за замовчуванням
+                            reading = SensorReading(
+                                sensor_id=str(row.get("sensor_id") or f"UNKNOWN_{idx}"),
+                                timestamp=str(row.get("timestamp") or "1970-01-01T00:00:00Z"),
+                                temperature=20.0,  # default
+                                humidity=50.0,     # default
+                                status="WARNING"   # помічаємо як сумнівний запис
+                            )
+                        else:
+                            raise
+
+                    # Стрімінговий запис результату без завантаження всього масиву у пам'ять
+                    if config.output_format == "csv" and writer:
+                        writer.writerow(reading.to_dict())
+                    else:
+                        out_file.write(json.dumps(reading.to_dict(), ensure_ascii=False) + "\n")
+                    
+                    written_count += 1
+
+        except Exception as pipeline_err:
+            logging.error(f"Пайплайн завершився аварійно. Вихідний файл захищено від пошкоджень.")
+            raise DataImportError("Помилка виконання pipeline.") from pipeline_err
+
+    logging.info(f"Пайплайн завершено. Оброблено: {processed_count}, Записано: {written_count}")
+
+
+# =====================================================================
+# 7. ГЕНЕРАЦІЯ ТЕСТОВИХ ДАНИХ ТА ДЕМОНСТРАЦІЯ
+# =====================================================================
+
+def generate_demo_files() -> Tuple[Path, Path, Path, Path]:
+    """Створює демо-файли для тестування різних політик у поточному каталозі."""
+    demo_dir = Path("./lab5_demo_temp")
+    demo_dir.mkdir(exist_ok=True)
+
+    input_csv = demo_dir / "input_telemetry.csv"
+    config_yaml = demo_dir / "config.yaml"
+    output_csv = demo_dir / "output_clean.csv"
+    output_jsonl = demo_dir / "output_clean.jsonl"
+
+    # Створюємо вхідний файл телеметрії (містить правильні та завідомо некоректні рядки)
+    # 1. Валідний запис
+    # 2. Невалідний запис (текстове значення замість температури)
+    # 3. Валідний запис
+    # 4. Невалідний запис (температура поза межами валідного діапазону)
+    # 5. Невалідний запис (пропущене обов'язкове поле humidity)
+    # 6. Невалідний запис (некоректний статус)
+    # 7. Валідний запис
+    with open(input_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerows(csv_rows)
+        writer.writerow(["sensor_id", "timestamp", "temperature", "humidity", "status"])
+        writer.writerow(["SEN_A01", "2023-11-23T12:00:00Z", "24.5", "55.0", "OK"])
+        writer.writerow(["SEN_A02", "2023-11-23T12:01:00Z", "NaN_Value", "60.0", "OK"])
+        writer.writerow(["SEN_A03", "2023-11-23T12:02:00Z", "12.2", "45.1", "WARNING"])
+        writer.writerow(["SEN_A04", "2023-11-23T12:03:00Z", "120.5", "30.0", "OK"])  # > 100.0
+        writer.writerow(["SEN_A05", "2023-11-23T12:04:00Z", "25.0", "", "OK"])        # порожнє значення
+        writer.writerow(["SEN_A06", "2023-11-23T12:05:00Z", "19.0", "50.0", "BAD_STATUS"])
+        writer.writerow(["SEN_A07", "2023-11-23T12:06:00Z", "-5.4", "88.0", "OK"])
 
-    # 3. Створення JSONL файлу для демонстрації іншого формату
-    jsonl_input_path = working_dir / "sensor_data.jsonl"
-    jsonl_rows = [
-        {"sensor_id": "SN-201", "timestamp": "2023-10-27T11:00:00Z", "temperature": 21.0, "humidity": 40.0, "status": "OK"},
-        {"sensor_id": "SN-202", "timestamp": "2023-10-27T11:15:00Z", "temperature": 55.0, "humidity": 50.0, "status": "ERROR"}, # Помилка: Temp > 50
-        {"sensor_id": "SN-203", "timestamp": "2023-10-27T11:30:00Z", "temperature": 15.1, "humidity": 65.2, "status": "OK"}
-    ]
-    with open(jsonl_input_path, "w", encoding="utf-8") as f:
-        for row in jsonl_rows:
-            f.write(json.dumps(row) + "\n")
+    # Записуємо початковий YAML конфіг для політики log_and_skip
+    yaml_content = f"""# Налаштування обробки телеметрії (Варіант №3)
+input_file: {input_csv.as_posix()}
+input_format: csv
+output_file: {output_csv.as_posix()}
+output_format: csv
+policy: log_and_skip
+min_temperature: -50.0
+max_temperature: 100.0
+min_humidity: 0.0
+max_humidity: 100.0
+"""
+    with open(config_yaml, "w", encoding="utf-8") as f:
+        f.write(yaml_content)
 
-    output_path = working_dir / "processed_output.jsonl"
-
-    return config_path, csv_input_path, jsonl_input_path, output_path
+    return input_csv, config_yaml, output_csv, output_jsonl
 
 
 def main() -> None:
-    # Організація тимчасової папки для роботи
-    working_dir = Path("./lab5_workspace")
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     
-    # Налаштування логування спочатку у базовий консольний вивід
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)]
-    )
+    print("=" * 70)
+    print("СТАРТ ДЕМОНСТРАЦІЇ ЛАБОРАТОРНОЇ РОБОТИ №5 (ВАРІАНТ №3)")
+    print("=" * 70)
+
+    input_csv, config_yaml, output_csv, output_jsonl = generate_demo_files()
+
+    print(f"\n[КРОК 1] Демо-файли згенеровано в директорії: {input_csv.parent.resolve()}")
+    print(f"Вхідний файл містить 3 валідних та 4 завідомо некоректних рядки.")
+
+    # -----------------------------------------------------------------
+    # ДЕМО 1: Політика LOG_AND_SKIP
+    # -----------------------------------------------------------------
+    print("\n" + "-" * 50)
+    print("ЕТАП 1: Запуск з політикою 'LOG_AND_SKIP' (пропуск некоректних)")
+    print("-" * 50)
+    
+    try:
+        run_pipeline(config_yaml)
+        print("\n[РЕЗУЛЬТАТ] Фільтрація завершилась успішно. Вміст очищеного файлу:")
+        if output_csv.exists():
+            print(output_csv.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Неочікувана помилка: {e}")
+
+    # -----------------------------------------------------------------
+    # ДЕМО 2: Політика STRICT та Атомарність запису
+    # -----------------------------------------------------------------
+    print("\n" + "-" * 50)
+    print("ЕТАП 2: Запуск з політикою 'STRICT' та тестування АТОМАРНОСТІ")
+    print("-" * 50)
+    
+    # Модифікуємо конфіг для використання режиму strict
+    with open(config_yaml, "w", encoding="utf-8") as f:
+        f.write(f"""input_file: {input_csv.as_posix()}
+input_format: csv
+output_file: {output_jsonl.as_posix()}
+output_format: jsonl
+policy: strict
+min_temperature: -50.0
+max_temperature: 100.0
+min_humidity: 0.0
+max_humidity: 100.0
+""")
+
+    # Попередньо переконуємося, що цільового файлу немає
+    if output_jsonl.exists():
+        output_jsonl.unlink()
+
+    print("Очікуємо падіння на першій помилці (рядок №2) через політику STRICT...")
+    try:
+        run_pipeline(config_yaml)
+    except Exception as err:
+        print(f"\n[УСПІШНО ПЕРЕХОПЛЕНО ПОМИЛКУ]: {err}")
+        print(f"Першопричина винятку (Exception Chaining): {err.__cause__}")
+        
+        # Перевірка атомарності
+        print("\nПеревірка захисту від пошкодження output-файлу:")
+        print(f"Чи з'явився файл {output_jsonl.name} на диску? -> {output_jsonl.exists()} (Очікується: False)")
+        if output_jsonl.exists():
+            print("ПОМИЛКА: Атомарність не спрацювала! Файл було створено/залишено частково записаним.")
+        else:
+            print("ГАРНА РОБОТА: Атомарний менеджер запобіг збереженню неповних/пошкоджених даних на диску!")
+
+    # -----------------------------------------------------------------
+    # ДЕМО 3: Політика FORCE_DEFAULT
+    # -----------------------------------------------------------------
+    print("\n" + "-" * 50)
+    print("ЕТАП 3: Запуск з політикою 'FORCE_DEFAULT' (автокорекція значеннями по замовчуванню)")
+    print("-" * 50)
+    
+    with open(config_yaml, "w", encoding="utf-8") as f:
+        f.write(f"""input_file: {input_csv.as_posix()}
+input_format: csv
+output_file: {output_jsonl.as_posix()}
+output_format: jsonl
+policy: force_default
+min_temperature: -50.0
+max_temperature: 100.0
+min_humidity: 0.0
+max_humidity: 100.0
+""")
 
     try:
-        logging.info("--- Підготовка мок-середовища для Лабораторної роботи №5 (Варіант №3) ---")
-        config_p, csv_p, jsonl_p, out_p = create_mock_environment(working_dir)
-
-        # 1. Завантаження конфігурації (Fail-fast)
-        logging.info("\n1. Завантаження конфігурації додатка...")
-        config = AppConfig(config_p)
-        logging.info(f"Конфігурація успішно зчитана: {config.data}")
-
-        # Створення пайплайну
-        pipeline = DataProcessingPipeline(config)
-
-        # 2. Обробка файлу CSV з політикою 'log_and_skip' (за замовчуванням)
-        logging.info(f"\n2. Запуск обробки CSV: {csv_p.name} (Політика: log_and_skip)")
-        pipeline.process(csv_p, out_p)
-
-        # Читання результату для демонстрації
-        logging.info("\nВміст вихідного файлу після обробки CSV:")
-        with open(out_p, "r", encoding="utf-8") as out_f:
-            for line in out_f:
-                logging.info(f" Результат запису: {line.strip()}")
-
-        # 3. Обробка файлу JSONL
-        logging.info(f"\n3. Запуск обробки JSONL: {jsonl_p.name}")
-        pipeline.process(jsonl_p, out_p)
-
-        logging.info("\nВміст вихідного файлу після обробки JSONL:")
-        with open(out_p, "r", encoding="utf-8") as out_f:
-            for line in out_f:
-                logging.info(f" Результат запису: {line.strip()}")
-
-        # 4. Демонстрація політики 'raise_on_invalid' (Критичне падіння за вимогою бізнесу)
-        logging.info("\n4. Зміна політики конфігурації на 'raise_on_invalid' (Fail-fast при обробці записів)...")
-        config.data["policy"] = "raise_on_invalid"
-        
-        try:
-            pipeline.process(csv_p, out_p)
-        except DataError as de:
-            logging.info(f"Перехоплено очікувану бізнес-помилку через політику 'raise_on_invalid':\n -> {de}")
-            if de.__cause__:
-                logging.info(f"Першопричина (Chained Exception): {de.__cause__}")
-
-        # 5. Демонстрація атомарності запису при виникненні непередбачуваної помилки
-        logging.info("\n5. Демонстрація стійкості до пошкодження вихідних файлів (Атомарний запис)...")
-        
-        # Визначимо завідомо некоректний вихідний файл з помилкою всередині процесу
-        corrupt_out_p = working_dir / "atomic_test_output.jsonl"
-        # Запишемо туди початкові валідні дані
-        with open(corrupt_out_p, "w", encoding="utf-8") as test_f:
-            test_f.write('{"status": "OLD_VALID_DATA"}\n')
-
-        # Спробуємо запустити процес, який гарантовано впаде посеред обробки через політику raise_on_invalid
-        try:
-            pipeline.process(csv_p, corrupt_out_p)
-        except DataError:
-            logging.info("Помилка сталася в середині процесу, перевіримо стан файлу...")
-
-        # Перевіримо, чи оригінальний файл залишився неушкодженим
-        with open(corrupt_out_p, "r", encoding="utf-8") as test_f:
-            current_content = test_f.read().strip()
-            logging.info(f"Вміст файлу після аварії пайплайну: '{current_content}'")
-            if "OLD_VALID_DATA" in current_content:
-                logging.info("Успіх! Атомарний запис захистив старий файл від пошкоджень та перезапису.")
-
-    except ApplicationError as ae:
-        logging.critical(f"Критична системна помилка роботи додатка: {ae}")
+        run_pipeline(config_yaml)
+        print("\n[РЕЗУЛЬТАТ] Обробка завершилась успішно. Вміст виправленого JSONL:")
+        if output_jsonl.exists():
+            print(output_jsonl.read_text(encoding="utf-8"))
     except Exception as e:
-        logging.critical(f"Неочікуване системне відхилення: {e}")
-    finally:
-        # Очищення тимчасової директорії
-        logging.info("\n--- Очищення тимчасових ресурсів та завершення ---")
-        try:
-            for file in working_dir.iterdir():
-                file.unlink()
-            working_dir.rmdir()
-            logging.info("Робочу область успішно очищено.")
-        except Exception as e:
-            logging.warning(f"Не вдалося коректно очистити файли: {e}")
+        print(f"Помилка: {e}")
+
+    # Очищення тимчасових файлів
+    print("\n" + "-" * 50)
+    print("ОЧИЩЕННЯ РЕСУРСІВ ТА ТИМЧАСОВИХ ФАЙЛІВ")
+    print("-" * 50)
+    for path in (input_csv, config_yaml, output_csv, output_jsonl):
+        if path.exists():
+            path.unlink()
+            print(f"Видалено тимчасовий файл: {path.name}")
+    try:
+        input_csv.parent.rmdir()
+        print("Видалено тимчасову директорію.")
+    except OSError:
+        pass
+
+    print("\n" + "=" * 70)
+    print("ДЕМОНСТРАЦІЮ УСПІШНО ЗАВЕРШЕНО")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
