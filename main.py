@@ -4,7 +4,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Generator
 from contextlib import contextmanager
 
 # Налаштування логування
@@ -29,7 +29,7 @@ class ConfigurationError(ApplicationError):
 
 # --- Atomic Writer ---
 @contextmanager
-def atomic_write(file_path: str | Path):
+def atomic_write(file_path: str | Path) -> Generator[Any, None, None]:
     """Context manager для атомарного запису файлу."""
     path = Path(file_path)
     # Створюємо тимчасовий файл у тій же директорії, що й цільовий
@@ -43,6 +43,7 @@ def atomic_write(file_path: str | Path):
         raise e
     else:
         temp_file.close()
+        # Забезпечуємо атомарну заміну
         os.replace(temp_file.name, path)
 
 # --- Processor ---
@@ -51,13 +52,13 @@ class DataProcessor:
         self.config = config
 
     def validate_record(self, record: Dict[str, Any], line_num: int):
-        if "id" not in record or not record["id"].strip().isdigit():
+        if "id" not in record or not str(record.get("id", "")).strip().isdigit():
             raise DataValidationError("Invalid ID format", line_number=line_num, field="id")
         if "value" not in record:
             raise DataValidationError("Missing value field", line_number=line_num, field="value")
         try:
             float(record["value"])
-        except ValueError:
+        except (ValueError, TypeError):
             raise DataValidationError("Invalid value format", line_number=line_num, field="value")
 
     def process_file(self, input_path: str, output_path: str):
@@ -65,27 +66,29 @@ class DataProcessor:
         if not input_path_obj.exists():
             raise ConfigurationError(f"File not found: {input_path}")
 
-        # Використовуємо streaming для читання та запису
-        with open(input_path, 'r', encoding='utf-8') as fin, \
-             atomic_write(output_path) as fout:
-            
-            reader = csv.DictReader(fin)
-            first_record = True
-            fout.write("[\n")
-            
-            for i, row in enumerate(reader, start=1):
-                try:
-                    self.validate_record(row, i)
-                    data = {"id": int(row["id"]), "value": float(row["value"])}
-                    
-                    if not first_record:
-                        fout.write(",\n")
-                    fout.write(json.dumps(data))
-                    first_record = False
-                except DataValidationError as e:
-                    logger.error(f"Skipping line {e.line_number}: {e} (Field: {e.field})")
-            
-            fout.write("\n]")
+        try:
+            with open(input_path, 'r', encoding='utf-8') as fin, \
+                 atomic_write(output_path) as fout:
+                
+                reader = csv.DictReader(fin)
+                first_record = True
+                fout.write("[\n")
+                
+                for i, row in enumerate(reader, start=1):
+                    try:
+                        self.validate_record(row, i)
+                        data = {"id": int(row["id"]), "value": float(row["value"])}
+                        
+                        if not first_record:
+                            fout.write(",\n")
+                        fout.write(json.dumps(data))
+                        first_record = False
+                    except DataValidationError as e:
+                        logger.error(f"Skipping line {e.line_number}: {e} (Field: {e.field})")
+                
+                fout.write("\n]")
+        except (IOError, OSError) as e:
+            raise ApplicationError(f"File I/O error: {e}")
 
 def main():
     config = {"threshold": 10}
